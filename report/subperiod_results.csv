@@ -1,0 +1,2 @@
+regime,n_folds,mean_pr_auc,std_pr_auc,mean_roc_auc,mean_positive_rate
+Rate Hike Cycle,15,0.372,0.114,0.576,0.223
