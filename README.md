@@ -90,7 +90,3 @@ earnings-surprise-classifier/
 ├── 01_run_analysis.py   # Master script
 └── README.md
 ```
-
-## Resume Bullet
-
-> Built an earnings surprise classifier using L1-regularized logistic regression to predict abnormal post-announcement returns for S&P 500 stocks. Applied Fama-French 3-factor event study methodology to construct binary labels, engineered pre-announcement features across price, momentum, fundamental, and macro dimensions, and implemented walk-forward cross-validation with within-fold standardization to prevent lookahead bias. Evaluated using precision-recall AUC given class imbalance; conducted subperiod analysis across market regimes to assess model stability.
