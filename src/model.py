@@ -40,10 +40,17 @@ accuracy trivially. Precision-recall tells the real story.
 import warnings
 import numpy as np
 import pandas as pd
+import matplotlib
+# Non-interactive backend: plt.show() becomes a no-op instead of requiring
+# a display. This script always saves figures via save_path, so plt.show()
+# calls only exist for interactive/notebook use — in a plain script or
+# background process, the default GUI backend can crash rather than no-op.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import seaborn as sns
 from sklearn.linear_model import LogisticRegressionCV, LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     average_precision_score,
@@ -149,17 +156,23 @@ def run_walk_forward(
         "fold_metrics": [],
         "feature_importances": [],
         "predictions": [],
+        "skipped_quarters": [],
     }
-    
+
     for fold_num, (train_idx, test_idx, test_q) in enumerate(folds):
         train_df = df.loc[train_idx]
         test_df = df.loc[test_idx]
-        
+
         y_train = train_df["label"].values
         y_test = test_df["label"].values
-        
-        # Skip folds with no positive examples in test set
+
+        # Skip folds with no positive examples in test set — PR-AUC and
+        # ROC-AUC are undefined with only one class present. Recorded in
+        # results["skipped_quarters"] so the aggregate metrics below can
+        # disclose whether any quarters were dropped, rather than silently
+        # shrinking the reported fold count.
         if y_test.sum() == 0:
+            results["skipped_quarters"].append(test_q)
             continue
         
         X_train = train_df[feature_cols].values
@@ -177,10 +190,14 @@ def run_walk_forward(
         X_test_scaled = scaler.transform(X_test_imp)  # transform, NOT fit_transform
         
         # Step 3: Fit L1 logistic regression with C tuned by inner CV
-        # cv=5 is an inner time-series CV within the training fold
+        # TimeSeriesSplit enforces that each inner validation block only
+        # ever follows its training data in time — a plain integer `cv`
+        # would default to StratifiedKFold, which (with shuffle=False)
+        # still lets later chronological data train on earlier validation
+        # blocks in some splits, leaking lookahead bias into C selection.
         model = LogisticRegressionCV(
             Cs=C_values,
-            cv=5,
+            cv=TimeSeriesSplit(n_splits=5),
             penalty="l1",
             solver="saga",
             scoring="average_precision",
@@ -239,7 +256,17 @@ def run_walk_forward(
     print(f"  Mean PR-AUC:    {fold_df['pr_auc'].mean():.3f} ± {fold_df['pr_auc'].std():.3f}")
     print(f"  Mean ROC-AUC:   {fold_df['roc_auc'].mean():.3f} ± {fold_df['roc_auc'].std():.3f}")
     print(f"  Mean Brier:     {fold_df['brier_score'].mean():.3f} ± {fold_df['brier_score'].std():.3f}")
-    
+
+    n_skipped = len(results["skipped_quarters"])
+    if n_skipped == 0:
+        print(f"\nNo quarters were skipped for having zero positive test examples — "
+              f"the {len(fold_df)} folds above cover every quarter in the walk-forward "
+              f"window, so this result is not a filtered subsample.")
+    else:
+        print(f"\n{n_skipped} quarter(s) skipped for having zero positive test examples "
+              f"(PR-AUC/ROC-AUC are undefined with one class): {results['skipped_quarters']}. "
+              f"Aggregate metrics above are computed only over the remaining {len(fold_df)} folds.")
+
     return results
 
 
@@ -282,12 +309,23 @@ def subperiod_analysis(results: dict) -> pd.DataFrame:
         mean_roc_auc=("roc_auc", "mean"),
         mean_positive_rate=("positive_rate_test", "mean"),
     ).round(3)
-    
+
+    # Lift = PR-AUC relative to the regime's OWN no-skill baseline (its own
+    # positive rate), not the raw PR-AUC. The no-skill baseline for PR-AUC
+    # moves with the positive rate, and that rate varies by regime — so
+    # comparing raw PR-AUC across regimes conflates "the model did better
+    # here" with "this regime just had a higher base rate of large surprises
+    # to begin with." Lift isolates the former.
+    summary["lift"] = (summary["mean_pr_auc"] / summary["mean_positive_rate"]).round(2)
+
     print("\nSubperiod performance analysis:")
     print(summary.to_string())
-    print("\nNOTE: Large performance differences across regimes suggest")
-    print("cross-sectional dependence and regime-dependent relationships.")
-    
+    print("\nNOTE: Compare regimes by 'lift', not raw mean_pr_auc — the no-skill")
+    print("baseline (positive rate) varies by regime, so raw PR-AUC conflates")
+    print("model skill with how common large surprises were in that period.")
+    print("Large differences in lift across regimes suggest regime-dependent")
+    print("relationships; large differences in raw PR-AUC alone may not.")
+
     return summary
 
 
@@ -391,20 +429,25 @@ def plot_performance_over_time(results: dict, save_path: str = None):
     """
     fold_df = results["fold_df"].copy()
     fold_df["test_quarter"] = pd.PeriodIndex(fold_df["test_quarter"], freq="Q")
-    fold_df = fold_df.sort_values("test_quarter")
-    
+    fold_df = fold_df.sort_values("test_quarter").reset_index(drop=True)
+
     fig, ax = plt.subplots(figsize=(12, 5), facecolor="white")
     ax.set_facecolor(LIGHT)
-    
-    # Shade COVID period
+
+    # Shade COVID period — only if a fold actually falls in that window.
+    # Without this guard, when no fold overlaps COVID, both boundaries
+    # fall back to 0 and axvspan(0, 0) draws a misleading zero-width
+    # marker at the start of the chart, mislabeled "COVID period."
     covid_start = pd.Period("2020Q1", freq="Q")
     covid_end = pd.Period("2020Q4", freq="Q")
-    ax.axvspan(
-        fold_df[fold_df["test_quarter"] >= covid_start].index.min() if len(fold_df[fold_df["test_quarter"] >= covid_start]) > 0 else 0,
-        fold_df[fold_df["test_quarter"] <= covid_end].index.max() if len(fold_df[fold_df["test_quarter"] <= covid_end]) > 0 else 0,
-        alpha=0.15, color="red", label="COVID period"
-    )
-    
+    covid_mask = (fold_df["test_quarter"] >= covid_start) & (fold_df["test_quarter"] <= covid_end)
+    if covid_mask.any():
+        ax.axvspan(
+            fold_df[covid_mask].index.min(),
+            fold_df[covid_mask].index.max(),
+            alpha=0.15, color="red", label="COVID period"
+        )
+
     x = range(len(fold_df))
     ax.plot(x, fold_df["pr_auc"], color=NAVY, lw=2, marker="o", ms=5, label="PR-AUC per fold")
     ax.axhline(fold_df["positive_rate_test"].mean(), color=GOLD, lw=1.5,

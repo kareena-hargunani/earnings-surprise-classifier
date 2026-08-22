@@ -46,9 +46,9 @@ from model import (
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-N_TICKERS = 50          # Set to None for full S&P 500
+N_TICKERS = None        # Set to None for full S&P 500
 START_DATE = "2015-01-01"
-CACHE = True            # Set to False to force re-pull all data
+CACHE = False           # Set to False to force re-pull all data
 ROLLING_WINDOW = 12     # Quarters for rolling window comparison
 SAVE_DIR = os.path.join(os.path.dirname(__file__), "report")
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -296,13 +296,15 @@ Results summary:
 
 Key assumptions and limitations:
   1. Survivorship bias: S&P 500 current constituents only
-  2. Cross-sectional dependence: same-date events share macro shocks
-     → Standard errors are understated; effective N < row count
-  3. Concept drift: earnings momentum anomalies weaken as they are exploited
-  4. Unknown future shocks: fixed effects cannot account for
-     unprecedented macro events in the prediction window
-  5. Data quality: yfinance EPS estimates are imperfect; WRDS/IBES
+  2. Concept drift: return anomalies (PEAD, earnings-surprise persistence)
+     tend to lose predictive power once documented, as informed capital
+     trades on them — see McLean & Pontiff (2016)
+  3. Unknown future shocks: no model can account for unscheduled
+     macro events in the prediction window
+  4. Data quality: yfinance EPS estimates are imperfect; WRDS/IBES
      would provide significantly cleaner labels
+  5. Zero-positive test quarters are skipped (see run_walk_forward
+     output above for whether any were skipped this run)
 
 Output files saved to report/:
   correlation_heatmap.png

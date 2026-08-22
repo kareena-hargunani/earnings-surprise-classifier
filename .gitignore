@@ -214,3 +214,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Personal working notes — not for public repo
+dev_run_notes.md

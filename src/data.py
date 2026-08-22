@@ -21,6 +21,7 @@ engineering stage (features.py), not here.
 import os
 import time
 import warnings
+import urllib.request
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -54,7 +55,12 @@ def get_sp500_tickers(cache: bool = True) -> list[str]:
     
     print("Fetching S&P 500 tickers from Wikipedia...")
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url, storage_options={"User-Agent": "Mozilla/5.0"})
+    # Wikipedia rejects requests without a browser-like User-Agent (403).
+    # Fetch manually rather than via read_html's storage_options, which
+    # isn't supported on all pandas versions.
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    html = urllib.request.urlopen(req).read()
+    tables = pd.read_html(html)
     df = tables[0][["Symbol", "GICS Sector"]].rename(
         columns={"Symbol": "ticker", "GICS Sector": "sector"}
     )
@@ -172,9 +178,14 @@ def get_earnings_data(
             print(f"  Progress: {i}/{len(tickers)} tickers...")
         try:
             t = yf.Ticker(ticker)
-            # earnings_dates returns a DataFrame indexed by earnings date
-            # with columns 'EPS Estimate' and 'Reported EPS'
-            earnings = t.earnings_dates
+            # The .earnings_dates property wraps get_earnings_dates() with a
+            # low implicit limit (empirically ~24 quarters / 6 years), which
+            # doesn't reach back to START_DATE. Calling get_earnings_dates()
+            # directly with an explicit limit pulls much deeper history —
+            # verified back to 2005+ with usable EPS estimate/actual data.
+            # limit=60 (~15 years) comfortably covers START_DATE plus a
+            # buffer for the trailing-4-quarter EPS-history features.
+            earnings = t.get_earnings_dates(limit=60)
             if earnings is None or earnings.empty:
                 continue
             earnings = earnings.reset_index()

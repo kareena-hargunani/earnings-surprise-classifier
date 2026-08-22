@@ -8,32 +8,28 @@ TWO STAGES:
 Stage 1 — Label construction (build_labels)
     For each earnings announcement, compute the abnormal return over
     the [0, +1] day event window using the Fama-French 3-factor model.
-    This directly mirrors the event study methodology used at Cornerstone,
-    with the difference that here we use the labels for prediction rather
-    than for measuring statistical significance after the fact.
 
 Stage 2 — Feature engineering (build_features)
-    For each earnings announcement, construct a feature vector using ONLY
-    information available strictly before the announcement date.
+    For each earnings announcement, construct a vector with features derived from
+    information that was publicly available prior to the earnings announcement. 
     Lookahead bias is enforced by an explicit date cutoff at every step.
 
-IMPORTANT: All features are computed as of (earnings_date - 1 trading day).
-The StandardScaler is fit WITHIN each training fold in model.py, not here.
-Here we return raw unscaled features. Scaling inside the pipeline prevents
-data leakage from future distributional information.
+All features are computed as of (earnings_date - 1 trading day).
+The StandardScaler is fit within each training fold in model.py
+to prevent data leakage from future distributional information. 
 """
 
 import warnings
 import numpy as np
 import pandas as pd
 from scipy import stats
+import statsmodels.api as sm
 
 warnings.filterwarnings("ignore")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Event window: day of announcement [0] and day after [+1]
-# We include day +1 because many earnings are announced after market close
+# Event window: day of announcement [0] and day after [+1] to be inclusive of announcements after market close
 EVENT_WINDOW = (0, 1)
 
 # Estimation window for FF model: 252 to 10 trading days before announcement
@@ -43,14 +39,13 @@ ESTIMATION_WINDOW = (-252, -10)
 
 # Label threshold: abnormal return > this value → positive class (label=1)
 # 3% represents roughly 1 standard deviation of daily returns for large caps
-# This is a judgment call documented in the write-up
 LABEL_THRESHOLD = 0.03
 
 # Minimum trading days required in estimation window to compute a valid label
 MIN_ESTIMATION_DAYS = 120
 
 
-# ── Stage 1: Label Construction ──────────────────────────────────────────────
+# ── Stage 1: Defining the Target: Abnormal Return Labels ─────────────────────
 
 def compute_abnormal_return(
     ticker: str,
@@ -69,17 +64,12 @@ def compute_abnormal_return(
         3. CAR = sum of (actual return - expected return) over event window
     
     Returns None if insufficient data is available.
-    
-    This is the same logic as a standard event study, implemented in Python.
-    The key difference from Cornerstone work: here we use the CAR as a
-    binary label for classification rather than testing its significance
-    against zero.
     """
-    # Get this ticker's price series
+    # Get price series
     ticker_prices = prices[prices["ticker"] == ticker].set_index("date")["adj_close"]
     ticker_prices = ticker_prices.sort_index()
     
-    # Compute daily log returns for the ticker
+    # Compute daily log returns
     ticker_returns = np.log(ticker_prices / ticker_prices.shift(1)).dropna()
     
     # Get all trading days relative to earnings_date
@@ -87,7 +77,7 @@ def compute_abnormal_return(
     try:
         event_idx = all_dates.get_loc(earnings_date)
     except KeyError:
-        # Earnings date is not a trading day — find the next trading day
+        # Edge case: If earnings date is not a trading day, then find the next trading day
         future_dates = all_dates[all_dates >= earnings_date]
         if len(future_dates) == 0:
             return None
@@ -98,7 +88,7 @@ def compute_abnormal_return(
     est_end_idx = event_idx + ESTIMATION_WINDOW[1]
     
     if est_start_idx < 0 or est_end_idx < 0:
-        return None  # Not enough history
+        return None  # If there isn't enough history, return None
     
     est_dates = all_dates[est_start_idx : est_end_idx + 1]
     
@@ -126,16 +116,24 @@ def compute_abnormal_return(
     if len(est_df) < MIN_ESTIMATION_DAYS:
         return None
     
-    # OLS: excess_ret ~ mkt_rf + smb + hml
-    X = est_df[["mkt_rf", "smb", "hml"]].values
-    X = np.column_stack([np.ones(len(X)), X])  # add intercept
+    # FF3 model: excess_ret ~ mkt_rf + smb + hml
+    X = sm.add_constant(est_df[["mkt_rf", "smb", "hml"]]) 
     y = est_df["excess_ret"].values
     
     try:
-        # Use numpy least squares for speed
-        coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-        alpha, beta_mkt, beta_smb, beta_hml = coeffs
-    except np.linalg.LinAlgError:
+    # X already includes the intercept column (constant), which statsmodels expects.
+    # If X does NOT already have it, add it: X = sm.add_constant(X)
+        model = sm.OLS(y, X).fit()
+        alpha     = model.params["const"]
+        beta_mkt  = model.params["mkt_rf"]
+        beta_smb  = model.params["smb"]
+        beta_hml  = model.params["hml"]
+
+    # Guard against silent NaN coefficients (degenerate/NaN inputs don't always raise)
+        if np.any(np.isnan(model.params)):
+            return None
+    
+    except (ValueError, np.linalg.LinAlgError):
         return None
     
     # Compute expected and abnormal returns on event window
@@ -228,7 +226,6 @@ def compute_features_for_event(
     earnings: pd.DataFrame,
     macro: pd.DataFrame,
     ff_factors: pd.DataFrame,
-    mkt_cap_df=None,
 ) -> dict | None:
     """
     Compute the full feature vector for a single earnings event.
@@ -338,19 +335,6 @@ def compute_features_for_event(
         features["vol_ratio"] = np.nan
     
     # ── D. Fundamental ───────────────────────────────────────────────────────
-    # We use log(market cap) — market cap spans orders of magnitude and
-    # a log transformation linearizes its relationship with returns
-    if mkt_cap_df is not None:
-        ticker_mc = mkt_cap_df[
-            (mkt_cap_df["ticker"] == ticker) &
-            (mkt_cap_df["date"] <= cutoff)
-        ].sort_values("date")
-        features["log_mkt_cap"] = (
-        ticker_mc["log_mkt_cap"].iloc[-1] if len(ticker_mc) > 0 else np.nan
-        ) 
-    else:
-        features["log_mkt_cap"] = np.nan
-
     # Historical P/E = price at cutoff / trailing twelve month EPS
     # Both components are point-in-time accurate
 
@@ -376,8 +360,7 @@ def compute_features_for_event(
         features["vix_level"] = latest_macro.get("vix", np.nan)
         features["treasury_10y"] = latest_macro.get("treasury_10y", np.nan)
         features["yield_spread"] = latest_macro.get("yield_spread", np.nan)
-        features["cfnai"] = latest_macro.get("cfnai", np.nan)
-        
+
         # VIX relative to its trailing 252-day median
         # Captures whether fear is elevated relative to recent norms
         # rather than using absolute VIX (which differs across regimes)
@@ -388,15 +371,6 @@ def compute_features_for_event(
             )
         else:
             features["vix_relative"] = np.nan
-        
-        # Is economic momemntum improving or deteriorating?
-        # Compare current CFNAI-MA3 to its value 3 months ago
-        if len(macro_pre) >= 90:
-            cfnai_now = macro_pre["cfnai"].iloc[-1]
-            cfnai_3m_ago = macro_pre["cfnai"].iloc[-90]
-            features["cfnai_momentum"] = cfnai_now - cfnai_3m_ago
-        else:
-            features["cfnai_momentum"] = np.nan
 
         # Market return in the 10 days before announcement
         # Captures broad market backdrop at the time of announcement
@@ -410,7 +384,7 @@ def compute_features_for_event(
             features["mkt_ret_10d"] = np.nan
     else:
         for col in ["vix_level", "treasury_10y", "yield_spread",
-                    "cfnai", "vix_relative", "cfnai_momentum", "mkt_ret_10d"]:
+                    "vix_relative", "mkt_ret_10d"]:
             features[col] = np.nan
     
     return features
@@ -422,7 +396,6 @@ def build_features(
     earnings: pd.DataFrame,
     macro: pd.DataFrame,
     ff_factors: pd.DataFrame,
-    mkt_cap_df=None,
 ) -> pd.DataFrame:
     """
     Build the full feature matrix for all labeled earnings events.
@@ -448,7 +421,6 @@ def build_features(
             earnings=earnings,
             macro=macro,
             ff_factors=ff_factors,
-            mkt_cap=mkt_cap_df,
         )
         if feat is not None:
             feat["label"] = row["label"]
@@ -480,9 +452,9 @@ FEATURE_COLS = [
     "eps_surprise_std_4q", "eps_beat_streak", "eps_surprise_trend",
     "ret_5d", "ret_60d", "ret_252d_ex1m",
     "realized_vol_30d", "realized_vol_60d", "vol_ratio",
-    "log_mkt_cap", "pe_ratio",
+    "pe_ratio",
     "vix_level", "treasury_10y", "yield_spread",
-    "cfnai", "vix_relative", "cfnai_momentum", "mkt_ret_10d",
+    "vix_relative", "mkt_ret_10d",
 ]
 
 # Economically motivated interaction terms
@@ -496,9 +468,6 @@ INTERACTION_PAIRS = [
     ("eps_surprise_mean_4q", "realized_vol_30d"),
     # Market backdrop interacts with individual stock momentum
     ("ret_5d", "mkt_ret_10d"),
-    # Yield curve stress amplifies earnings sensitivity
-    ("yield_spread", "realized_vol_30d"),
-    ("cfnai", "realized_vol_30d"),
 ]
 
 # Features where we expect nonlinear (quadratic) relationships
