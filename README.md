@@ -109,8 +109,6 @@ Several features are deliberately correlated by construction — a raw feature a
 pip install yfinance pandas-datareader pandas numpy scikit-learn statsmodels lxml matplotlib seaborn scipy xgboost
 ```
 
-**macOS note**: `xgboost` requires the OpenMP runtime (`libomp`), which isn't a Python package and won't be installed by pip. If `import xgboost` fails with a `libomp.dylib` load error, run `brew install libomp` first.
-
 ## Usage
 
 ```bash
