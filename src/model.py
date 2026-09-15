@@ -50,6 +50,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import seaborn as sns
 from sklearn.linear_model import LogisticRegressionCV, LogisticRegression
+from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -266,6 +267,156 @@ def run_walk_forward(
         print(f"\n{n_skipped} quarter(s) skipped for having zero positive test examples "
               f"(PR-AUC/ROC-AUC are undefined with one class): {results['skipped_quarters']}. "
               f"Aggregate metrics above are computed only over the remaining {len(fold_df)} folds.")
+
+    return results
+
+
+# ── Robustness Check: Gradient Boosted Trees ────────────────────────────────
+
+def run_walk_forward_gbm(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    rolling_window: int = None,
+    random_state: int = 42,
+) -> dict:
+    """
+    Robustness check for the Lasso results: same walk-forward fold
+    structure and evaluation as run_walk_forward, but fits an XGBoost
+    classifier instead of L1 logistic regression.
+
+    Purpose: the hand-specified interaction/polynomial terms in
+    features.py encode specific economic hypotheses about which
+    nonlinearities matter. A tree ensemble discovers interactions and
+    nonlinearities automatically, with no need to specify them in advance.
+    Comparable-or-better PR-AUC here would suggest the hand-built feature
+    set already captures most of the exploitable structure; meaningfully
+    better GBM performance would suggest the manual feature engineering
+    left real predictive power on the table.
+
+    Two simplifications relative to run_walk_forward, both because
+    tree-based models don't need them:
+      - No median imputation: XGBoost handles missing values natively
+        (sparsity-aware split finding).
+      - No StandardScaler: tree splits are scale-invariant, so scaling
+        (which matters for Lasso's penalty) has no effect here.
+
+    Hyperparameters (max_depth, learning_rate) are still tuned via an
+    inner TimeSeriesSplit, the same temporal-validity discipline used for
+    Lasso's C — a plain random inner split would let later-in-training
+    data validate a model fit partly on earlier data within the same
+    training fold, the same lookahead-bias risk fixed for run_walk_forward.
+    """
+    param_grid = [
+        {"max_depth": d, "learning_rate": lr}
+        for d in [2, 3, 4]
+        for lr in [0.05, 0.1]
+    ]
+
+    df = df.copy().reset_index(drop=True)
+    folds = make_quarterly_folds(df, rolling_window=rolling_window)
+
+    print(f"Walk-forward CV (GBM robustness check): {len(folds)} test folds")
+
+    results = {
+        "fold_metrics": [],
+        "predictions": [],
+        "skipped_quarters": [],
+    }
+
+    for fold_num, (train_idx, test_idx, test_q) in enumerate(folds):
+        train_df = df.loc[train_idx]
+        test_df = df.loc[test_idx]
+
+        y_train = train_df["label"].values
+        y_test = test_df["label"].values
+
+        if y_test.sum() == 0:
+            results["skipped_quarters"].append(test_q)
+            continue
+
+        X_train = train_df[feature_cols].values
+        X_test = test_df[feature_cols].values
+
+        # Inner CV: pick (max_depth, learning_rate) via TimeSeriesSplit,
+        # scored on average_precision to match the outer evaluation metric.
+        tscv = TimeSeriesSplit(n_splits=5)
+        best_score, best_params = -np.inf, param_grid[0]
+        for params in param_grid:
+            scores = []
+            for inner_train_idx, inner_val_idx in tscv.split(X_train):
+                if y_train[inner_val_idx].sum() == 0:
+                    continue
+                m = XGBClassifier(
+                    max_depth=params["max_depth"],
+                    learning_rate=params["learning_rate"],
+                    random_state=random_state,
+                    eval_metric="logloss",
+                    n_jobs=-1,
+                )
+                m.fit(X_train[inner_train_idx], y_train[inner_train_idx])
+                p = m.predict_proba(X_train[inner_val_idx])[:, 1]
+                scores.append(average_precision_score(y_train[inner_val_idx], p))
+            if scores and np.mean(scores) > best_score:
+                best_score = np.mean(scores)
+                best_params = params
+
+        # Step: fit final model on the full training fold with the
+        # selected hyperparameters, predict on the untouched test fold.
+        model = XGBClassifier(
+            max_depth=best_params["max_depth"],
+            learning_rate=best_params["learning_rate"],
+            random_state=random_state,
+            eval_metric="logloss",
+            n_jobs=-1,
+        )
+        model.fit(X_train, y_train)
+        y_prob = model.predict_proba(X_test)[:, 1]
+
+        pr_auc = average_precision_score(y_test, y_prob)
+        roc_auc = roc_auc_score(y_test, y_prob) if y_test.sum() > 0 else np.nan
+        brier = brier_score_loss(y_test, y_prob)
+
+        results["fold_metrics"].append({
+            "test_quarter": test_q,
+            "n_train": len(train_idx),
+            "n_test": len(test_idx),
+            "n_positive_test": int(y_test.sum()),
+            "positive_rate_test": y_test.mean(),
+            "pr_auc": pr_auc,
+            "roc_auc": roc_auc,
+            "brier_score": brier,
+            "best_max_depth": best_params["max_depth"],
+            "best_learning_rate": best_params["learning_rate"],
+        })
+
+        pred_df = test_df[["ticker", "earnings_date", "label", "car"]].copy()
+        pred_df["predicted_prob"] = y_prob
+        pred_df["test_quarter"] = test_q
+        results["predictions"].append(pred_df)
+
+        if fold_num % 4 == 0:
+            print(f"  Q{test_q}: PR-AUC={pr_auc:.3f}, ROC-AUC={roc_auc:.3f}, "
+                  f"n_test={len(test_idx)}, depth={best_params['max_depth']}, "
+                  f"lr={best_params['learning_rate']}")
+
+    fold_df = pd.DataFrame(results["fold_metrics"])
+    results["fold_df"] = fold_df
+    results["predictions_df"] = pd.concat(results["predictions"], ignore_index=True)
+
+    print(f"\nGBM aggregate results across {len(fold_df)} folds:")
+    print(f"  Mean PR-AUC:    {fold_df['pr_auc'].mean():.3f} ± {fold_df['pr_auc'].std():.3f}")
+    print(f"  Mean ROC-AUC:   {fold_df['roc_auc'].mean():.3f} ± {fold_df['roc_auc'].std():.3f}")
+    print(f"  Mean Brier:     {fold_df['brier_score'].mean():.3f} ± {fold_df['brier_score'].std():.3f}")
+
+    n_skipped = len(results["skipped_quarters"])
+    if n_skipped == 0:
+        print(f"\nNo quarters were skipped for having zero positive test examples — "
+              f"the {len(fold_df)} folds above cover every quarter in the walk-forward "
+              f"window, so this result is not a filtered subsample.")
+    else:
+        print(f"\n{n_skipped} quarter(s) skipped for having zero positive test examples: "
+              f"{results['skipped_quarters']}. Aggregate metrics above are computed only "
+              f"over the remaining {len(fold_df)} folds.")
 
     return results
 

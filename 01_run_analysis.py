@@ -39,7 +39,7 @@ from features import (
     FEATURE_COLS
 )
 from model import (
-    run_walk_forward, subperiod_analysis,
+    run_walk_forward, run_walk_forward_gbm, subperiod_analysis,
     plot_pr_curve, plot_feature_importance,
     plot_performance_over_time, plot_correlation_heatmap,
 )
@@ -48,7 +48,7 @@ from model import (
 
 N_TICKERS = None        # Set to None for full S&P 500
 START_DATE = "2015-01-01"
-CACHE = False           # Set to False to force re-pull all data
+CACHE = True            # Set to False to force re-pull all data
 ROLLING_WINDOW = 12     # Quarters for rolling window comparison
 SAVE_DIR = os.path.join(os.path.dirname(__file__), "report")
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -239,6 +239,44 @@ elif exp_pr > rol_pr + 0.02:
     print("→ Expanding outperforms: more data is beneficial, limited concept drift.")
 else:
     print("→ Similar performance: no strong evidence of concept drift.")
+
+# ── Step 7b: Robustness Check — Gradient Boosted Trees ────────────────────────
+
+print("\n" + "=" * 60)
+print("STEP 7b: Walk-forward CV — gradient boosted trees (robustness check)")
+print("=" * 60)
+print("""
+Rationale:
+    The interaction and polynomial terms used by the Lasso model encode
+    specific, hand-picked economic hypotheses about which nonlinearities
+    matter. Gradient boosted trees discover interactions and nonlinearities
+    automatically, with no need to specify them in advance. This isn't a
+    replacement for the Lasso model — a tree ensemble's feature importances
+    are a less clean, less economically-interpretable signal than a Lasso
+    coefficient with a specific sign and story attached — it's a check on
+    whether the hand-built feature set already captures most of the
+    exploitable structure, or whether a fully flexible model finds
+    meaningfully more.
+""")
+
+results_gbm = run_walk_forward_gbm(
+    df=feature_df_nl,
+    feature_cols=all_feature_cols,
+)
+
+gbm_pr = results_gbm["fold_df"]["pr_auc"].mean()
+print(f"\nLasso (expanding) mean PR-AUC: {exp_pr:.3f}")
+print(f"GBM mean PR-AUC:               {gbm_pr:.3f}")
+if gbm_pr > exp_pr + 0.02:
+    print("→ GBM outperforms: the hand-specified interactions may be leaving")
+    print("  real predictive structure on the table.")
+elif exp_pr > gbm_pr + 0.02:
+    print("→ Lasso outperforms: the hand-built feature set already captures")
+    print("  most of the exploitable structure; added model flexibility isn't")
+    print("  translating into better out-of-sample performance here.")
+else:
+    print("→ Similar performance: the hand-specified interactions appear to")
+    print("  capture roughly what a fully flexible model finds on its own.")
 
 # ── Step 8: Subperiod Analysis ────────────────────────────────────────────────
 

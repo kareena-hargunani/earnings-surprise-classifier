@@ -64,6 +64,8 @@ Macro regime factors such as the 10Y treasury and VIX level could genuinely cont
 Past quarter's earnings surprise is also significant, in line with Bernard & Thomas' finding that investors underestimate the persistence of EPS beat. Thus, investors do not raise their expecations of future earnings proportionally to the stock's earnings momentum. 
 While I find positive, non-zero coefficients on volatility, macro regime, and EPS factors, the finding does not show that markets are inefficient. The Chow-test results argue against structural breaks being the primary explanation, but the coefficients could still reflect a real rational risk premium that FF3 doesn't measure. However, the results do raise caution in taking semi-strong EMH as a given assumption when predicting whether an earnings event alone causes an abnormal stock price reaction. 
 
+**Robustness check: gradient boosted trees.** The Lasso model relies specified interaction and polynomial terms. As a robustness check, I ran the same walk-forward evaluation with an `XGBClassifier` which can discover interactions and nonlinearities automatically. Its hyperparameters (tree depth, learning rate) were tuned the same way as Lasso's `C`, via an inner `TimeSeriesSplit` on each training fold. This model yields a mean PR-AUC of 0.276 ± 0.049 while the Lasso model yields a mean PR-AUC of 0.273 ± 0.052. The performance of the models are well within fold-to-fold noise. The inner CV selected the shallowest tree depth in the search grid for almost every fold, meaning the model had the freedom to build deep, complex interaction structures and mostly chose not to. This suggests that the specified interaction terms capture close to what a fully flexible model finds on the same data. 
+
 ## Key Design Decisions
 
 **Why Precision-Recall AUC, not accuracy?**
@@ -104,8 +106,10 @@ Several features are deliberately correlated by construction — a raw feature a
 ## Setup
 
 ```bash
-pip install yfinance pandas-datareader pandas numpy scikit-learn statsmodels lxml matplotlib seaborn scipy
+pip install yfinance pandas-datareader pandas numpy scikit-learn statsmodels lxml matplotlib seaborn scipy xgboost
 ```
+
+**macOS note**: `xgboost` requires the OpenMP runtime (`libomp`), which isn't a Python package and won't be installed by pip. If `import xgboost` fails with a `libomp.dylib` load error, run `brew install libomp` first.
 
 ## Usage
 
