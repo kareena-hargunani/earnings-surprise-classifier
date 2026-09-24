@@ -49,6 +49,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import seaborn as sns
+import statsmodels.api as sm
 from sklearn.linear_model import LogisticRegressionCV, LogisticRegression
 from xgboost import XGBClassifier
 from sklearn.model_selection import TimeSeriesSplit
@@ -417,6 +418,171 @@ def run_walk_forward_gbm(
         print(f"\n{n_skipped} quarter(s) skipped for having zero positive test examples: "
               f"{results['skipped_quarters']}. Aggregate metrics above are computed only "
               f"over the remaining {len(fold_df)} folds.")
+
+    return results
+
+
+# ── CAR Magnitude Model ──────────────────────────────────────────────────────
+
+def _winsorize_train_test(
+    train_df: pd.DataFrame, test_df: pd.DataFrame, cols: list[str],
+    lower: float = 0.01, upper: float = 0.99,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Clip `cols` to quantile bounds computed on the TRAINING fold only, then
+    apply those same bounds to both train and test. A single extreme
+    outlier (e.g. a pe_ratio of 2.4e17 from a near-zero EPS estimate) can
+    otherwise dominate an OLS design matrix's condition number and produce
+    a numerically degenerate fit. Computing bounds from train only avoids
+    leaking test-fold distributional information, the same discipline
+    StandardScaler follows elsewhere in this module.
+    """
+    train_df, test_df = train_df.copy(), test_df.copy()
+    for col in cols:
+        lo, hi = train_df[col].quantile([lower, upper])
+        train_df[col] = train_df[col].clip(lo, hi)
+        test_df[col] = test_df[col].clip(lo, hi)
+    return train_df, test_df
+
+
+def run_walk_forward_car_regression(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    surprise_prob_col: str = None,
+    interact_cols: list[str] = None,
+    rolling_window: int = None,
+) -> dict:
+    """
+    Predicts the continuous, signed CAR (not the binary threshold label)
+    out-of-sample, producing a `car_hat` for every walk-forward test event.
+    `actual_car - car_hat` is then a disclosure-specific abnormal return:
+    whatever part of the reaction pre-announcement information could NOT
+    explain (see README "Possible applications").
+
+    Model: OLS of car on pre-announcement covariates only — the same
+    feature set and walk-forward discipline as the classifier, just with
+    a continuous target and no L1 penalty (interpretable OLS coefficients
+    are the point here, not sparse feature selection).
+
+    surprise_prob_col / interact_cols are optional: if supplied, a
+    predicted surprise-direction probability (e.g. the out-of-sample
+    output of a separate walk-forward classifier — NOT the realized
+    surprise sign, which would leak the disclosure's own content into
+    car_hat) and its interactions with interact_cols are added to the
+    design matrix. Left as None, the model uses pre-announcement
+    covariates alone.
+
+    Standard errors are clustered by ticker rather than HC1-robust: the
+    same company appears across many walk-forward folds, so treating each
+    event as independent understates the standard errors. This is the
+    "validate by ticker rather than in aggregate" check referenced in the
+    README Motivation section.
+    """
+    df = df.copy().reset_index(drop=True)
+    folds = make_quarterly_folds(df, rolling_window=rolling_window)
+
+    all_x_cols = list(feature_cols)
+    if surprise_prob_col:
+        all_x_cols += [surprise_prob_col] + [
+            f"{surprise_prob_col}_x_{c}" for c in (interact_cols or [])
+        ]
+
+    print(f"Walk-forward CV (CAR magnitude regression): {len(folds)} test folds")
+
+    results = {
+        "fold_metrics": [],
+        "coefficients": [],
+        "predictions": [],
+        "skipped_quarters": [],
+    }
+
+    for fold_num, (train_idx, test_idx, test_q) in enumerate(folds):
+        train_df = df.loc[train_idx].dropna(subset=all_x_cols + ["car"])
+        test_df = df.loc[test_idx].dropna(subset=all_x_cols + ["car"])
+
+        if len(train_df) == 0 or len(test_df) == 0:
+            results["skipped_quarters"].append(test_q)
+            continue
+
+        train_df, test_df = _winsorize_train_test(train_df, test_df, feature_cols)
+
+        X_train = sm.add_constant(train_df[all_x_cols], has_constant="add")
+        X_test = sm.add_constant(test_df[all_x_cols], has_constant="add")
+        X_test = X_test[X_train.columns]  # enforce identical column order
+        y_train = train_df["car"]
+        y_test = test_df["car"]
+
+        model = sm.OLS(y_train, X_train).fit(
+            cov_type="cluster", cov_kwds={"groups": train_df["ticker"]}
+        )
+        car_hat = model.predict(X_test)
+
+        # Out-of-sample R²: compares the model's squared error against a
+        # naive baseline that predicts the TRAINING fold's mean CAR for
+        # every test event — using the test fold's own mean here would
+        # leak test-set information into the "no-skill" baseline.
+        naive_pred = train_df["car"].mean()
+        ss_res = float(((y_test - car_hat) ** 2).sum())
+        ss_naive = float(((y_test - naive_pred) ** 2).sum())
+        oos_r2 = 1 - ss_res / ss_naive if ss_naive > 0 else np.nan
+        rmse = float(np.sqrt(np.mean((y_test - car_hat) ** 2)))
+        corr = float(np.corrcoef(y_test, car_hat)[0, 1]) if len(y_test) > 1 else np.nan
+
+        results["fold_metrics"].append({
+            "test_quarter": test_q,
+            "n_train": len(train_df),
+            "n_test": len(test_df),
+            "n_tickers_train": train_df["ticker"].nunique(),
+            "oos_r2": oos_r2,
+            "rmse": rmse,
+            "corr_actual_predicted": corr,
+        })
+
+        coef_df = pd.DataFrame({
+            "feature": model.params.index,
+            "coefficient": model.params.values,
+            "cluster_robust_pvalue": model.pvalues.values,
+            "test_quarter": test_q,
+        })
+        results["coefficients"].append(coef_df)
+
+        pred_df = test_df[["ticker", "earnings_date", "car"]].copy()
+        pred_df["car_hat"] = car_hat.values
+        pred_df["disclosure_specific_car"] = pred_df["car"] - pred_df["car_hat"]
+        pred_df["test_quarter"] = test_q
+        results["predictions"].append(pred_df)
+
+        if fold_num % 4 == 0:
+            print(f"  Q{test_q}: OOS R²={oos_r2:.3f}, RMSE={rmse:.4f}, "
+                  f"corr={corr:.3f}, n_test={len(test_df)}, "
+                  f"n_tickers_train={train_df['ticker'].nunique()}")
+
+    fold_df = pd.DataFrame(results["fold_metrics"])
+    results["fold_df"] = fold_df
+    results["predictions_df"] = pd.concat(results["predictions"], ignore_index=True)
+    results["coefficients_df"] = pd.concat(results["coefficients"], ignore_index=True)
+
+    print(f"\nCAR regression aggregate results across {len(fold_df)} folds:")
+    print(f"  Mean OOS R²:            {fold_df['oos_r2'].mean():.4f} ± {fold_df['oos_r2'].std():.4f}")
+    print(f"  Mean RMSE:              {fold_df['rmse'].mean():.4f}")
+    print(f"  Mean corr(actual,pred): {fold_df['corr_actual_predicted'].mean():.3f}")
+
+    coef_df = results["coefficients_df"]
+    print("\nCoefficient significance across folds (cluster-robust p<0.05):")
+    for name in all_x_cols:
+        sub = coef_df[coef_df["feature"] == name]
+        n_sig = (sub["cluster_robust_pvalue"] < 0.05).sum()
+        print(f"  {name:45s} mean coef={sub['coefficient'].mean(): .5f}  "
+              f"significant in {n_sig}/{len(sub)} folds")
+
+    n_skipped = len(results["skipped_quarters"])
+    if n_skipped == 0:
+        print(f"\nNo quarters were skipped — the {len(fold_df)} folds above "
+              f"cover every quarter with usable train/test rows.")
+    else:
+        print(f"\n{n_skipped} quarter(s) skipped for having no usable "
+              f"train/test rows after dropping missing values: "
+              f"{results['skipped_quarters']}.")
 
     return results
 

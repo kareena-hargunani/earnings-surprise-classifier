@@ -39,7 +39,8 @@ from features import (
     FEATURE_COLS
 )
 from model import (
-    run_walk_forward, run_walk_forward_gbm, subperiod_analysis,
+    run_walk_forward, run_walk_forward_gbm, run_walk_forward_car_regression,
+    subperiod_analysis,
     plot_pr_curve, plot_feature_importance,
     plot_performance_over_time, plot_correlation_heatmap,
 )
@@ -277,6 +278,32 @@ elif exp_pr > gbm_pr + 0.02:
 else:
     print("→ Similar performance: the hand-specified interactions appear to")
     print("  capture roughly what a fully flexible model finds on its own.")
+
+# ── Step 7c: CAR Magnitude Model ────────────────────────────────────────────
+
+print("\n" + "=" * 60)
+print("STEP 7c: CAR magnitude model")
+print("=" * 60)
+print("""
+Rationale:
+    The classifier above predicts whether CAR crosses a fixed +3% threshold
+    — it can't distinguish a 3.1% reaction from a 40% one. This model
+    predicts the continuous, signed CAR directly, out-of-sample, walk-
+    forward validated, using the same pre-announcement feature set and
+    fold structure as the classifier, but OLS instead of L1 logistic
+    regression (interpretable coefficients on the actual target, not a
+    sparse feature selection). Standard errors are clustered by ticker —
+    the same company appears across many walk-forward folds, so treating
+    each event as independent would understate the standard errors.
+""")
+
+results_car = run_walk_forward_car_regression(
+    df=feature_df_nl,
+    feature_cols=base_feature_cols,
+)
+results_car["fold_df"].to_csv(
+    os.path.join(SAVE_DIR, "car_regression_fold_results.csv"), index=False
+)
 
 # ── Step 8: Subperiod Analysis ────────────────────────────────────────────────
 
