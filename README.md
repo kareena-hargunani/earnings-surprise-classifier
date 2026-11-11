@@ -2,6 +2,20 @@
 
 A logistic regression model that predicts whether a stock will experience a significant abnormal return following an earnings announcement, using only information available before the announcement date.
 
+## Summary
+
+Can public information available before an earnings announcement predict which stocks will react strongly? I built an L1-regularized logistic regression classifier to find out, using Fama-French 3-factor event-study labels (CAR > 3% over days 0 to +1).
+
+**Data:** 19,930 earnings events across 503 S&P 500 tickers, mid-2018 to mid-2026.
+**Validation:** walk-forward cross-validation across 33 quarterly folds, with all scaling and tuning done inside each training fold to avoid look-ahead bias.
+
+**Results**
+- Pooled PR-AUC 0.226 vs. a 0.184 no-skill baseline; the model beats its baseline by 1.44x to 1.65x in every market regime (Pre-COVID, COVID, Post-COVID, Rate Hike Cycle).
+- A gradient boosted tree (XGBoost) robustness check performs the same (mean PR-AUC 0.276 vs. 0.273), so added model complexity does not help.
+- Predicting the *size* of the reaction (continuous CAR) fails out-of-sample (mean R² ≈ -0.006).
+
+**Conclusion:** pre-announcement public information carries a small but detectable signal, strongest in volatility and macro-regime variables. It is not enough to predict reaction magnitude, and the results do not show that markets are inefficient: the volatility effect may reflect a risk premium that the Fama-French benchmark does not capture.
+
 ## Motivation
 
 Standard event studies (Fama-French methodology) take semi-strong-form market efficiency as a *maintained assumption*. Then, it follows that the price reaction around a public disclosure is the market's response to the new information that the disclosure makes available to the public. This project does not take semi-strong EMH as a given assumption. This project asks the core research question: Does semi-strong EMH hold with respect to pre-announcement public information for earnings events, and can that information predict, out-of-sample, which future announcements will produce large abnormal reactions?
